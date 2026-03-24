@@ -41,8 +41,19 @@ import datetime
 from dateutil.relativedelta import relativedelta
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.column import Column, _to_java_column
 from pyspark.sql.window import Window
 from pyspark.sql.types import IntegerType, DoubleType, StringType
+
+
+def percentile_approx(col, pct, accuracy=10000):
+    """Wrapper for percentile_approx that works on PySpark 2.4.x."""
+    sc = SparkSession.builder.getOrCreate()._jvm
+    return Column(
+        sc.org.apache.spark.sql.functions.percentile_approx(
+            _to_java_column(col), pct, accuracy
+        )
+    )
 
 spark = SparkSession.builder.appName("viettel_feature_engineering").getOrCreate()
 
@@ -324,11 +335,11 @@ def build_agg(df, group_by, columns, functions, conditions):
                 elif func_name == "std":
                     agg_list.append(F.stddev(expr).alias(ft_name))
                 elif func_name == "med":
-                    agg_list.append(F.percentile(expr, 0.5).alias(ft_name))
+                    agg_list.append(percentile_approx(expr, 0.5).alias(ft_name))
                 elif func_name == "pct25":
-                    agg_list.append(F.percentile(expr, 0.25).alias(ft_name))
+                    agg_list.append(percentile_approx(expr, 0.25).alias(ft_name))
                 elif func_name == "pct75":
-                    agg_list.append(F.percentile(expr, 0.75).alias(ft_name))
+                    agg_list.append(percentile_approx(expr, 0.75).alias(ft_name))
                 elif func_name == "kurt":
                     agg_list.append(F.kurtosis(expr).alias(ft_name))
                 elif func_name == "skew":
