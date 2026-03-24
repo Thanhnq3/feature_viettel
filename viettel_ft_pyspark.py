@@ -41,19 +41,8 @@ import datetime
 from dateutil.relativedelta import relativedelta
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.column import Column, _to_java_column
 from pyspark.sql.window import Window
 from pyspark.sql.types import IntegerType, DoubleType, StringType
-
-
-def percentile_approx(col, pct, accuracy=10000):
-    """Wrapper for percentile_approx that works on PySpark 2.4.x."""
-    sc = SparkSession.builder.getOrCreate()._jvm
-    return Column(
-        sc.org.apache.spark.sql.functions.percentile_approx(
-            _to_java_column(col), pct, accuracy
-        )
-    )
 
 spark = SparkSession.builder.appName("viettel_feature_engineering").getOrCreate()
 
@@ -317,39 +306,63 @@ def build_agg(df, group_by, columns, functions, conditions):
     """
     Generic aggregation builder following tcb_ft_final pattern.
     conditions: list of [filter_expr, suffix_str]
+
+    Spark 2.4.4 compatible: percentile functions (med, pct25, pct75) use
+    F.expr("percentile_approx(...)") via SQL, which requires pre-materialized
+    temp columns since F.when() Column objects can't be embedded in SQL strings.
     """
+    PERCENTILE_MAP = {"med": 0.5, "pct25": 0.25, "pct75": 0.75}
+    needs_percentile = any(f in PERCENTILE_MAP for f in functions)
+
+    # Pre-add temp columns for percentile computation (SQL expr needs column names)
+    tmp_col_names = []
+    if needs_percentile:
+        for col_name in columns:
+            for cond_expr, suffix in conditions:
+                tmp_name = f"__tmp_{col_name}{suffix}"
+                df = df.withColumn(tmp_name, F.when(cond_expr, F.col(col_name)).cast("double"))
+                tmp_col_names.append(tmp_name)
+
     agg_list = []
     for col_name in columns:
         for func_name in functions:
             for cond_expr, suffix in conditions:
                 ft_name = f"{col_name}_{func_name}{suffix}"
-                expr = F.when(cond_expr, F.col(col_name))
-                if func_name == "sum":
-                    agg_list.append(F.sum(expr).alias(ft_name))
-                elif func_name == "avg":
-                    agg_list.append(F.avg(expr).alias(ft_name))
-                elif func_name == "min":
-                    agg_list.append(F.min(expr).alias(ft_name))
-                elif func_name == "max":
-                    agg_list.append(F.max(expr).alias(ft_name))
-                elif func_name == "std":
-                    agg_list.append(F.stddev(expr).alias(ft_name))
-                elif func_name == "med":
-                    agg_list.append(percentile_approx(expr, 0.5).alias(ft_name))
-                elif func_name == "pct25":
-                    agg_list.append(percentile_approx(expr, 0.25).alias(ft_name))
-                elif func_name == "pct75":
-                    agg_list.append(percentile_approx(expr, 0.75).alias(ft_name))
-                elif func_name == "kurt":
-                    agg_list.append(F.kurtosis(expr).alias(ft_name))
-                elif func_name == "skew":
-                    agg_list.append(F.skewness(expr).alias(ft_name))
-                elif func_name == "count":
-                    agg_list.append(F.count(expr).alias(ft_name))
-                elif func_name == "countDistinct":
-                    agg_list.append(F.countDistinct(F.when(cond_expr, F.col(col_name))).alias(ft_name))
+                if func_name in PERCENTILE_MAP:
+                    tmp_name = f"__tmp_{col_name}{suffix}"
+                    pct = PERCENTILE_MAP[func_name]
+                    agg_list.append(
+                        F.expr(f"percentile_approx(`{tmp_name}`, {pct})").alias(ft_name)
+                    )
+                else:
+                    expr = F.when(cond_expr, F.col(col_name))
+                    if func_name == "sum":
+                        agg_list.append(F.sum(expr).alias(ft_name))
+                    elif func_name == "avg":
+                        agg_list.append(F.avg(expr).alias(ft_name))
+                    elif func_name == "min":
+                        agg_list.append(F.min(expr).alias(ft_name))
+                    elif func_name == "max":
+                        agg_list.append(F.max(expr).alias(ft_name))
+                    elif func_name == "std":
+                        agg_list.append(F.stddev(expr).alias(ft_name))
+                    elif func_name == "kurt":
+                        agg_list.append(F.kurtosis(expr).alias(ft_name))
+                    elif func_name == "skew":
+                        agg_list.append(F.skewness(expr).alias(ft_name))
+                    elif func_name == "count":
+                        agg_list.append(F.count(expr).alias(ft_name))
+                    elif func_name == "countDistinct":
+                        agg_list.append(F.countDistinct(expr).alias(ft_name))
 
-    return df.groupBy(*group_by).agg(*agg_list)
+    result = df.groupBy(*group_by).agg(*agg_list)
+
+    # Drop temp columns (they disappear after groupBy, but be explicit)
+    for tmp_name in tmp_col_names:
+        if tmp_name in result.columns:
+            result = result.drop(tmp_name)
+
+    return result
 
 
 def build_final_features(df_daily: DataFrame, df_buyer_monthly: DataFrame, run_date) -> DataFrame:
