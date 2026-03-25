@@ -1,0 +1,282 @@
+# -------------------------------------------------
+# 1. Normalize phone candidates
+# -------------------------------------------------
+normalize_phone_candidates_udf = F.udf(
+    lambda s: (
+        [] if s is None else
+        list(dict.fromkeys([
+            re.sub(
+                r"^0+", "0",
+                ("0" + t[2:] if t.startswith("84") and len(t) >= 11 else t)
+            )
+            for t in re.split(r"\D+", str(s))
+            if t and 9 <= len(
+                re.sub(
+                    r"^0+", "0",
+                    ("0" + t[2:] if t.startswith("84") and len(t) >= 11 else t)
+                )
+            ) <= 12
+        ]))
+    ),
+    T.ArrayType(T.StringType())
+)
+
+# -------------------------------------------------
+# 2. Normalize emails
+# -------------------------------------------------
+_email_re = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")
+
+normalize_emails_udf = F.udf(
+    lambda s: (
+        [] if s is None else
+        list(dict.fromkeys([
+            p.strip()
+            for p in re.split(r"[\s,;|/]+", str(s).lower())
+            if p and _email_re.match(p.strip())
+        ]))
+    ),
+    T.ArrayType(T.StringType())
+)
+
+# -------------------------------------------------
+# 3. Normalize ID documents
+# -------------------------------------------------
+normalize_id_doc_udf = F.udf(
+    lambda s: (
+        [] if s is None else
+        list(dict.fromkeys([
+            re.sub(r"[^A-Z0-9]", "", p)
+            for p in re.split(r"[\s,;|/]+", str(s).upper())
+            if re.sub(r"[^A-Z0-9]", "", p)
+        ]))
+    ),
+    T.ArrayType(T.StringType())
+)
+
+# -------------------------------------------------
+# 4. Union nhiều array (array_union chỉ nhận 2 tham số)
+# -------------------------------------------------
+def array_union_chain(*cols):
+    col = cols[0]
+    for c in cols[1:]:
+        col = F.array_union(col, c)
+    return col
+
+# -------------------------------------------------
+# 5. Tạo mọi cặp 2 phần tử (array<struct<a,b>>)
+# -------------------------------------------------
+pair_struct = T.StructType([
+    T.StructField("a", T.StringType(), False),
+    T.StructField("b", T.StringType(), False),
+])
+
+combinations_pairs_udf = F.udf(
+    lambda msts: (
+        [] if not msts else [
+            (min(a, b), max(a, b))
+            for a, b in itertools.combinations(
+                sorted(set([str(x) for x in msts])), 2
+            )
+        ]
+    ),
+    T.ArrayType(pair_struct)
+)
+
+# -------------------------------------------------
+# 6. Join array<string> bằng dấu phẩy
+# -------------------------------------------------
+join_with_comma_udf = F.udf(
+    lambda arr: None if not arr else ", ".join([str(x) for x in arr]),
+    T.StringType()
+)
+
+# -------------------------------------------------
+# 7. Format detail:
+#    array<struct<rel:string, vals:array<string>>> -> string
+# -------------------------------------------------
+format_detail_udf = F.udf(
+    lambda items: (
+        None if not items else
+        ", ".join([
+            "{" + it["rel"] + ": " + ", ".join(it["vals"] or []) + "}"
+            for it in items
+        ])
+    ),
+    T.StringType()
+)
+
+################### Func
+
+
+
+def find_related_customers_spark(
+    df,
+    mst_col="col18",
+    rep_id_col="col12",
+    email_cols=("col21", "col211", "col212"),
+    phone_cols=("col27", "col52", "col22"),
+):
+    # -------------------------------------------------
+    # 1. Chuẩn hoá MST
+    # -------------------------------------------------
+    data = (
+        df.withColumn(mst_col, F.col(mst_col).cast("string"))
+          .withColumn(mst_col, F.trim(F.col(mst_col)))
+    )
+
+    # -------------------------------------------------
+    # 2. Build normalized arrays
+    # -------------------------------------------------
+    # Phones
+    phone_arrays = []
+    for c in phone_cols:
+        phone_arrays.append(
+            normalize_phone_candidates_udf(F.col(c).cast("string"))
+            if c in data.columns else F.array()
+        )
+
+    phones_all = array_union_chain(
+        *[F.coalesce(p, F.array()) for p in phone_arrays]
+    )
+
+    # Emails
+    email_arrays = []
+    for c in email_cols:
+        email_arrays.append(
+            normalize_emails_udf(F.col(c).cast("string"))
+            if c in data.columns else F.array()
+        )
+
+    emails_all = array_union_chain(
+        *[F.coalesce(e, F.array()) for e in email_arrays]
+    )
+
+    # Rep IDs
+    rep_ids = (
+        normalize_id_doc_udf(F.col(rep_id_col).cast("string"))
+        if rep_id_col in data.columns else F.array()
+    )
+
+    data = (
+        data.withColumn("_phones_all", F.array_sort(F.array_distinct(phones_all)))
+            .withColumn("_emails_all", F.array_sort(F.array_distinct(emails_all)))
+            .withColumn("_rep_ids",    F.array_sort(F.array_distinct(rep_ids)))
+    )
+
+    # -------------------------------------------------
+    # 3. Helper: từ (mst, array) -> (a,b,val,rel)
+    # -------------------------------------------------
+    def build_pairs_with_vals(list_col, label):
+        exploded = (
+            data.select(
+                    F.col(mst_col).alias("mst"),
+                    F.col(list_col).alias("arr")
+                )
+                .withColumn("val", F.explode_outer("arr"))
+                .filter(
+                    F.col("val").isNotNull() &
+                    (F.col("val") != "")
+                )
+        )
+
+        # group by val -> collect msts -> generate unordered pairs
+        msts_by_val = (
+            exploded.groupBy("val")
+                    .agg(F.collect_set("mst").alias("msts"))
+                    .withColumn("pairs", combinations_pairs_udf(F.col("msts")))
+                    .select("val", F.explode_outer("pairs").alias("p"))
+                    .select(
+                        "val",
+                        F.col("p.a").alias("a"),
+                        F.col("p.b").alias("b")
+                    )
+                    .withColumn("rel", F.lit(label))
+        )
+        return msts_by_val
+
+    # -------------------------------------------------
+    # 4. Sinh các cặp theo từng tiêu chí
+    # -------------------------------------------------
+    pairs_phone = build_pairs_with_vals("_phones_all", "Trùng SĐT")
+    pairs_email = build_pairs_with_vals("_emails_all", "Trùng email")
+    pairs_iddoc = build_pairs_with_vals(
+        "_rep_ids", "Trùng Số giấy tờ người đại diện"
+    )
+
+    all_pairs = (
+        pairs_phone
+        .unionByName(pairs_email, allowMissingColumns=True)
+        .unionByName(pairs_iddoc, allowMissingColumns=True)
+    )
+
+    # -------------------------------------------------
+    # 5. Aggregate theo (a,b,rel) -> vals
+    # -------------------------------------------------
+    per_rel = (
+        all_pairs.groupBy("a", "b", "rel")
+                 .agg(
+                     F.array_sort(
+                         F.array_distinct(
+                             F.collect_list("val")
+                         )
+                     ).alias("vals")
+                 )
+    )
+
+    # -------------------------------------------------
+    # 6. Tổng hợp mối quan hệ
+    # -------------------------------------------------
+    rel_summary = (
+        per_rel.groupBy("a", "b")
+               .agg(
+                   F.array_sort(
+                       F.array_distinct(
+                           F.collect_list("rel")
+                       )
+                   ).alias("rels")
+               )
+               .withColumn(
+                   "moi_quan_he",
+                   join_with_comma_udf(F.col("rels"))
+               )
+               .select("a", "b", "moi_quan_he")
+    )
+
+    # -------------------------------------------------
+    # 7. Tổng hợp chi tiết giá trị trùng
+    # -------------------------------------------------
+    detail_summary = (
+        per_rel.groupBy("a", "b")
+               .agg(
+                   F.collect_list(
+                       F.struct(
+                           F.col("rel").alias("rel"),
+                           F.col("vals").alias("vals")
+                       )
+                   ).alias("items")
+               )
+               .withColumn(
+                   "chi_tiet_gia_tri_trung",
+                   format_detail_udf(F.col("items"))
+               )
+               .select("a", "b", "chi_tiet_gia_tri_trung")
+    )
+
+    # -------------------------------------------------
+    # 8. Output cuối
+    # -------------------------------------------------
+    out = (
+        rel_summary.join(detail_summary, on=["a", "b"], how="left")
+                   .select(
+                       F.col("a").alias("Mã số thuế đơn vị"),
+                       F.col("b").alias("Mã số thuế bên liên quan"),
+                       F.col("moi_quan_he").alias("mối quan hệ"),
+                       F.col("chi_tiet_gia_tri_trung")
+                   )
+                   .orderBy(
+                       "Mã số thuế đơn vị",
+                       "Mã số thuế bên liên quan"
+                   )
+    )
+
+    return out
