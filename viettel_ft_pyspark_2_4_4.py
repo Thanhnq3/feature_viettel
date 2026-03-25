@@ -63,11 +63,8 @@ STG_TABLE = "your_schema.viettel_stg_daily"
 MONTHLY_TABLE = "your_schema.viettel_monthly"
 FT_TABLE = "your_schema.viettel_ft_seller"
 
-COL_INVOICE_ID = "col1"
 COL_RECORD_TS = "col4"
 COL_INVOICE_STATUS = "col9"
-COL_ADJ_TYPE = "col10"
-COL_ADJ_STATUS = "col11"
 COL_SELLER_MST = "col21"
 COL_INVOICE_ISSUE_TS = "col23"
 COL_BUYER_MST = "col29"
@@ -81,11 +78,10 @@ COL_DISCOUNT = "col48"
 COL_SETTLEMENT_DISCOUNT = "col49"
 COL_TOTAL_WITH_VAT = "col52"
 COL_TOTAL_WITHOUT_VAT = "col53"
-COL_TOTAL_VAT_FRN = "col55"
 COL_CURRENCY = "col65"
-COL_ORIG_INVOICE = "col72"
 COL_PAYMENT_METHOD = "col79"
 COL_ITEM_JSON = "col94"
+COL_FINAL_SALE = "total_amount_with_vat_final"
 COL_PARTITION = "col129"
 
 NIGHT_START = 22
@@ -104,49 +100,6 @@ def f_last_day_of_previous_month(data_date):
 
 def f_first_day_of_previous_month(data_date, nbr_of_mth):
     return data_date.replace(day=1) - relativedelta(months=nbr_of_mth)
-
-
-def compute_adjusted_sales(df):
-    """
-    Compute total_sales handling adjustment and replacement invoices.
-    Logic from dev_ft_viettel_3:
-        - col10=9 (monetary adjustment): total = iv1.col55 + iv2.col55
-        - col10=3 (replacement): total = iv2.col55 (original)
-        - else: total = iv1.col55
-    Where iv2 is the original invoice joined via col72 -> col1.
-    """
-    iv1 = df.alias("iv1")
-    iv2 = df.alias("iv2")
-
-    joined = iv1.join(
-        iv2.select(
-            F.col(COL_INVOICE_ID).alias("_orig_id"),
-            F.col(COL_TOTAL_VAT_FRN).alias("_orig_total"),
-            F.col(COL_PARTITION).alias("_orig_part"),
-        ),
-        on=(
-            (F.col("iv1.{}".format(COL_ORIG_INVOICE)) == F.col("_orig_id"))
-            & (F.col("iv1.{}".format(COL_PARTITION)) == F.col("_orig_part"))
-        ),
-        how="left",
-    )
-
-    joined = joined.withColumn(
-        "total_sales",
-        F.when(
-            F.col("iv1.{}".format(COL_ADJ_TYPE)) == 9,
-            F.coalesce(F.col("iv1.{}".format(COL_TOTAL_VAT_FRN)).cast("double"), F.lit(0.0))
-            + F.coalesce(F.col("_orig_total").cast("double"), F.lit(0.0)),
-        )
-        .when(
-            F.col("iv1.{}".format(COL_ADJ_TYPE)) == 3,
-            F.coalesce(F.col("_orig_total").cast("double"), F.lit(0.0)),
-        )
-        .otherwise(
-            F.coalesce(F.col("iv1.{}".format(COL_TOTAL_VAT_FRN)).cast("double"), F.lit(0.0))
-        ),
-    )
-    return joined
 
 
 # =============================================================================
@@ -261,23 +214,24 @@ def build_staging(df_raw):
     """
     From raw invoice data, produce daily seller-level metrics.
     Filters: only issued invoices (col9 = 1).
+    Uses pre-computed total_amount_with_vat_final as total_sales.
     """
     df = df_raw.filter(F.col(COL_INVOICE_STATUS).cast("int") == 1)
-    df = compute_adjusted_sales(df)
 
     df = (
         df
-        .withColumn("mst_seller", F.trim(F.col("iv1.{}".format(COL_SELLER_MST)).cast("string")))
-        .withColumn("mst_buyer", F.trim(F.col("iv1.{}".format(COL_BUYER_MST)).cast("string")))
+        .withColumn("mst_seller", F.trim(F.col(COL_SELLER_MST).cast("string")))
+        .withColumn("mst_buyer", F.trim(F.col(COL_BUYER_MST).cast("string")))
         .withColumn(
             "invoice_ts",
             F.coalesce(
-                F.to_timestamp(F.col("iv1.{}".format(COL_INVOICE_ISSUE_TS))),
-                F.to_timestamp(F.col("iv1.{}".format(COL_RECORD_TS))),
+                F.to_timestamp(F.col(COL_INVOICE_ISSUE_TS)),
+                F.to_timestamp(F.col(COL_RECORD_TS)),
             ),
         )
         .withColumn("report_date", F.to_date("invoice_ts"))
         .withColumn("hour", F.hour("invoice_ts"))
+        .withColumn("total_sales", F.col(COL_FINAL_SALE).cast("double"))
         .withColumn(
             "is_night",
             (F.col("hour") >= F.lit(NIGHT_START)) | (F.col("hour") < F.lit(NIGHT_END)),
@@ -286,12 +240,12 @@ def build_staging(df_raw):
             "is_core",
             (F.col("hour") >= F.lit(CORE_START)) & (F.col("hour") < F.lit(CORE_END)),
         )
-        .withColumn("tax_amt", F.col("iv1.{}".format(COL_TAX_AMT)).cast("double"))
-        .withColumn("discount_amt", F.col("iv1.{}".format(COL_DISCOUNT)).cast("double"))
-        .withColumn("total_without_vat", F.col("iv1.{}".format(COL_TOTAL_WITHOUT_VAT)).cast("double"))
-        .withColumn("total_with_vat", F.col("iv1.{}".format(COL_TOTAL_WITH_VAT)).cast("double"))
-        .withColumn("payment_method", F.col("iv1.{}".format(COL_PAYMENT_METHOD)))
-        .withColumn("transport", F.col("iv1.{}".format(COL_TRANSPORT)))
+        .withColumn("tax_amt", F.col(COL_TAX_AMT).cast("double"))
+        .withColumn("discount_amt", F.col(COL_DISCOUNT).cast("double"))
+        .withColumn("total_without_vat", F.col(COL_TOTAL_WITHOUT_VAT).cast("double"))
+        .withColumn("total_with_vat", F.col(COL_TOTAL_WITH_VAT).cast("double"))
+        .withColumn("payment_method", F.col(COL_PAYMENT_METHOD))
+        .withColumn("transport", F.col(COL_TRANSPORT))
     )
 
     df = df.filter(F.col("mst_seller").isNotNull() & F.col("report_date").isNotNull())
@@ -362,17 +316,17 @@ def build_staging(df_raw):
 def build_buyer_staging(df_raw):
     """Monthly buyer-seller pair aggregation for buyer concentration features."""
     df = df_raw.filter(F.col(COL_INVOICE_STATUS).cast("int") == 1)
-    df = compute_adjusted_sales(df)
 
     df = (
         df
-        .withColumn("mst_seller", F.trim(F.col("iv1.{}".format(COL_SELLER_MST)).cast("string")))
-        .withColumn("mst_buyer", F.trim(F.col("iv1.{}".format(COL_BUYER_MST)).cast("string")))
+        .withColumn("mst_seller", F.trim(F.col(COL_SELLER_MST).cast("string")))
+        .withColumn("mst_buyer", F.trim(F.col(COL_BUYER_MST).cast("string")))
+        .withColumn("total_sales", F.col(COL_FINAL_SALE).cast("double"))
         .withColumn(
             "invoice_ts",
             F.coalesce(
-                F.to_timestamp(F.col("iv1.{}".format(COL_INVOICE_ISSUE_TS))),
-                F.to_timestamp(F.col("iv1.{}".format(COL_RECORD_TS))),
+                F.to_timestamp(F.col(COL_INVOICE_ISSUE_TS)),
+                F.to_timestamp(F.col(COL_RECORD_TS)),
             ),
         )
         .withColumn("report_date", F.to_date("invoice_ts"))
