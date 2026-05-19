@@ -63,8 +63,11 @@ STG_TABLE = "your_schema.viettel_stg_daily"
 MONTHLY_TABLE = "your_schema.viettel_monthly"
 FT_TABLE = "your_schema.viettel_ft_seller"
 
+COL_INVOICE_ID = "id"
 COL_RECORD_TS = "col4"
 COL_INVOICE_STATUS = "col9"
+COL_ADJ_TYPE = "adjustment_type"
+COL_ADJ_STATUS = "adjustment_status"
 COL_SELLER_MST = "col21"
 COL_INVOICE_ISSUE_TS = "col23"
 COL_BUYER_MST = "col29"
@@ -79,10 +82,16 @@ COL_SETTLEMENT_DISCOUNT = "col49"
 COL_TOTAL_WITH_VAT = "col52"
 COL_TOTAL_WITHOUT_VAT = "col53"
 COL_CURRENCY = "col65"
+COL_ORIG_INVOICE = "orignal_invoice_no"
 COL_PAYMENT_METHOD = "col79"
 COL_ITEM_JSON = "col94"
+COL_PARTITION = "partition_month"
+COL_PARTITION_TIMESTAMP = "signed_date_proc"
+COL_ERROR_CODE = "error_code"
+COL_BIz_TYPE = "bisiness_type"
 COL_FINAL_SALE = "total_amount_with_vat_final"
-COL_PARTITION = "col129"
+COL_TRUSTED_PARTNER = ""
+
 
 NIGHT_START = 22
 NIGHT_END = 6
@@ -654,12 +663,232 @@ def build_top_days(df_daily, df_seller_total):
 
 
 # =============================================================================
+# STEP 3G: FEATURES FROM RAW (raw -> monthly aggregation)
+# Aggregates directly from raw invoice data to monthly features per seller.
+# Returns one row per (mst_seller, report_date=month_end); caller filters to
+# the target month before joining into the final feature table.
+#
+# Path A — raw -> monthly (direct):
+#   Taxcode-buyer totals; highest-invoice value;
+#   most/least-frequent buyer; top-1/2/3 buyer concentration.
+# Path B — raw -> daily -> monthly:
+#   No-sales-day gap metrics (all invoices and taxcode-buyer invoices).
+# =============================================================================
+
+def features_from_raw(df_raw):
+    # -------------------------------------------------------------------------
+    # PRE-PROCESS: shared base DataFrame, cached because all five paths below
+    # read from it. COL_PARTITION_TIMESTAMP ("signed_date_proc") is the
+    # canonical signed/issued date used across raw-level feature functions.
+    # -------------------------------------------------------------------------
+    df_raw_proc = (
+        df_raw
+        .withColumn("mst_seller",      F.trim(F.col(COL_SELLER_MST).cast("string")))
+        .withColumn("mst_buyer",       F.trim(F.col(COL_BUYER_MST).cast("string")))
+        .withColumn("invoice_ts",      F.to_timestamp(F.col(COL_PARTITION_TIMESTAMP)))
+        .withColumn("report_date",     F.to_date("invoice_ts"))
+        .withColumn("month_end",       F.last_day(F.col("report_date")))
+        .withColumn("total_sales",     F.col(COL_FINAL_SALE).cast("double"))
+        .withColumn("discount_amount", F.col(COL_DISCOUNT).cast("double"))
+        .filter(F.col("mst_seller").isNotNull())
+        .cache()   # shared across paths A-1, A-2, A-3, B-1, B-2 below
+    )
+
+    # -------------------------------------------------------------------------
+    # PATH A-1: three taxcode-buyer monthly totals in ONE scan.
+    # CHANGE from original: df_monthly_1/2/3 were three separate groupBy scans
+    # on the same filter+keys; merged into a single agg to reduce shuffle cost.
+    # -------------------------------------------------------------------------
+    df_monthly_taxcode = (
+        df_raw_proc
+        .filter(F.col("mst_buyer").isNotNull())
+        .groupBy("mst_seller", "month_end")
+        .agg(
+            F.sum("discount_amount").alias("monthly_total_discount_buyer_taxcode"),
+            F.countDistinct("mst_buyer").alias("monthly_distinct_buyer_count"),
+            F.sum("total_sales").alias("monthly_total_sales_buyer_taxcode"),
+        )
+        .withColumnRenamed("month_end", "report_date")
+    )
+
+    # -------------------------------------------------------------------------
+    # PATH A-2: highest single-invoice value per seller per month.
+    # CHANGE from original (df_monthly_4): replaced row_number() window sort
+    # with F.max() — semantically identical for top-1 value, but avoids the
+    # full sort-based window computation on the raw invoice grain.
+    # -------------------------------------------------------------------------
+    df_monthly_highest_inv = (
+        df_raw_proc
+        .filter(F.col("total_sales") > 0)
+        .groupBy("mst_seller", "month_end")
+        .agg(F.max("total_sales").alias("monthly_sales_amt_highest_inv"))
+        .withColumnRenamed("month_end", "report_date")
+    )
+
+    # -------------------------------------------------------------------------
+    # PATH A-3: buyer-frequency and top-buyer sales features.
+    #
+    # CHANGE from original:
+    #   - df_buyer_freq was scanned 4× (top1, top2, top3, monthly_sales).
+    #   - Now: one df_buyer_agg scan -> three window ranks in one chain ->
+    #     cached as df_buyer_ranked -> consumed by three derived frames.
+    #   - Top-1/2/3 sales and total seller sales computed in a single agg using
+    #     conditional sums (rank_sales == 1, <= 2, <= 3), eliminating df_top1/2/3
+    #     and the separate df_monthly_sales scan.
+    #   - result_added intermediate join chain is inlined into final assembly.
+    #
+    # NOTE: row_number() breaks ties arbitrarily within a tied inv_cnt or sales_amt
+    # group, so most/least-frequent buyer selection is non-deterministic on ties.
+    # -------------------------------------------------------------------------
+    df_buyer_agg = (
+        df_raw_proc
+        .filter(F.col("mst_buyer").isNotNull() & (F.col("total_sales") > 0))
+        .groupBy("mst_seller", "month_end", "mst_buyer")
+        .agg(
+            F.count("total_sales").alias("inv_cnt"),
+            F.sum("total_sales").alias("sales_amt"),
+            F.sum("discount_amount").alias("disc_amt_sum"),
+        )
+    )
+
+    # Three window specs in one chain; cached so df_most_freq / df_least_freq /
+    # df_top_buyers each read from the cached plan instead of recomputing it.
+    w_freq_most  = Window.partitionBy("mst_seller", "month_end").orderBy(F.col("inv_cnt").desc())
+    w_freq_least = Window.partitionBy("mst_seller", "month_end").orderBy(F.col("inv_cnt").asc())
+    w_sales      = Window.partitionBy("mst_seller", "month_end").orderBy(F.col("sales_amt").desc())
+
+    df_buyer_ranked = (
+        df_buyer_agg
+        .withColumn("rank_most",  F.row_number().over(w_freq_most))
+        .withColumn("rank_least", F.row_number().over(w_freq_least))
+        .withColumn("rank_sales", F.row_number().over(w_sales))
+        .cache()
+    )
+
+    # Most-frequent buyer (rank_most == 1): invoice count, sales, discount, per-tx sales
+    df_most_freq = (
+        df_buyer_ranked
+        .filter(F.col("rank_most") == 1)
+        .select(
+            "mst_seller",
+            F.col("month_end").alias("report_date"),
+            F.col("inv_cnt").alias("inv_cnt_freq_buyer_taxcode"),
+            F.col("sales_amt").alias("sales_amt_most_freq_buyer_taxcode"),
+            (F.col("sales_amt") / F.col("inv_cnt")).alias("sales_amt_most_freq_buyer_taxcode_per_trans"),
+            F.col("disc_amt_sum").alias("disc_amt_most_freq_buyer_taxcode"),
+        )
+    )
+
+    # Least-frequent buyer (rank_least == 1): invoice count, sales, per-tx sales
+    df_least_freq = (
+        df_buyer_ranked
+        .filter(F.col("rank_least") == 1)
+        .select(
+            "mst_seller",
+            F.col("month_end").alias("report_date"),
+            F.col("inv_cnt").alias("inv_cnt_least_freq_buyer_taxcode"),
+            F.col("sales_amt").alias("sales_amt_least_freq_buyer_taxcode"),
+            (F.col("sales_amt") / F.col("inv_cnt")).alias("sales_amt_least_freq_buyer_taxcode_per_trans"),
+        )
+    )
+
+    # CHANGE: top-1/2/3 buyer sales + total seller sales in ONE groupBy+agg.
+    # Conditional sums on rank_sales replace three filter-then-groupBy passes.
+    # monthly_sales_amt (total seller sales) also computed here, removing the
+    # separate df_monthly_sales scan from the original code.
+    df_top_buyers = (
+        df_buyer_ranked
+        .groupBy("mst_seller", "month_end")
+        .agg(
+            F.sum("sales_amt").alias("monthly_sales_amt"),
+            F.sum(F.when(F.col("rank_sales") == 1, F.col("sales_amt"))).alias("sales_amt_top1_big_buyer_taxcode"),
+            F.sum(F.when(F.col("rank_sales") <= 2, F.col("sales_amt"))).alias("sales_amt_top2_big_buyer_taxcode"),
+            F.sum(F.when(F.col("rank_sales") <= 3, F.col("sales_amt"))).alias("sales_amt_top3_big_buyer_taxcode"),
+        )
+        .withColumn(
+            "sales_amt_top3_big_buyer_taxcode_vs_sales_amt",
+            # Null (not 0.0) when monthly_sales_amt == 0 to avoid spurious zero ratios
+            F.when(
+                F.col("monthly_sales_amt") > 0,
+                F.col("sales_amt_top3_big_buyer_taxcode") / F.col("monthly_sales_amt"),
+            ).otherwise(F.lit(None)),
+        )
+        .withColumnRenamed("month_end", "report_date")
+    )
+
+    # -------------------------------------------------------------------------
+    # PATH B: raw -> daily aggregate -> monthly gap sum.
+    #
+    # w_count_day partitions by mst_seller only (no month_end boundary), so
+    # F.lag() finds the previous calendar date with any sales for that seller,
+    # which may be in a prior month.  The days_gap for the first sale of a new
+    # month therefore includes the cross-month gap.  When summed per month, the
+    # result is "total calendar gap between consecutive sale dates" rather than
+    # "intra-month no-sale days only" — intentional per original notebook design.
+    #
+    # CHANGE: eliminated intermediate variables (df_days, df_days_2, df_days_taxcode,
+    # df_days_taxcode_2) by inlining the lag+datediff step into the chain.
+    # -------------------------------------------------------------------------
+    w_count_day = Window.partitionBy("mst_seller").orderBy("report_date")
+
+    # All-invoices path: deduplicate to daily grain, compute gaps, sum per month
+    df_day_cnt_no_sales = (
+        df_raw_proc
+        .groupBy("mst_seller", "month_end", "report_date")
+        .agg(F.sum("total_sales").alias("daily_sales"))
+        .withColumn("days_gap", F.datediff("report_date", F.lag("report_date").over(w_count_day)))
+        .groupBy("mst_seller", "month_end")
+        .agg(F.sum("days_gap").alias("day_cnt_no_sales"))
+        .withColumnRenamed("month_end", "report_date")
+    )
+
+    # Taxcode-buyer path: same logic, restricted to invoices with a buyer taxcode
+    df_day_cnt_no_sales_per_cus = (
+        df_raw_proc
+        .filter(F.col("mst_buyer").isNotNull())
+        .groupBy("mst_seller", "month_end", "report_date")
+        .agg(F.sum("total_sales").alias("daily_sales"))
+        .withColumn("days_gap", F.datediff("report_date", F.lag("report_date").over(w_count_day)))
+        .groupBy("mst_seller", "month_end")
+        .agg(F.sum("days_gap").alias("day_cnt_no_sales_per_cus_taxcode"))
+        .withColumnRenamed("month_end", "report_date")
+    )
+
+    # -------------------------------------------------------------------------
+    # ASSEMBLY: join all monthly feature frames on (mst_seller, report_date).
+    # Anchor on df_monthly_taxcode (sellers with ≥1 taxcode-buyer invoice).
+    # CHANGE: result_added intermediate from original notebook is inlined here;
+    # all sub-frames already carry report_date so no rename is needed at join time.
+    # -------------------------------------------------------------------------
+    df_monthly_proc = (
+        df_monthly_taxcode
+        .join(df_monthly_highest_inv,      on=["mst_seller", "report_date"], how="left")
+        .join(df_most_freq,                on=["mst_seller", "report_date"], how="left")
+        .join(df_least_freq,               on=["mst_seller", "report_date"], how="left")
+        .join(df_top_buyers,               on=["mst_seller", "report_date"], how="left")
+        .join(df_day_cnt_no_sales,         on=["mst_seller", "report_date"], how="left")
+        .join(df_day_cnt_no_sales_per_cus, on=["mst_seller", "report_date"], how="left")
+    )
+
+    return df_monthly_proc
+
+
+# =============================================================================
 # STEP 4: ORCHESTRATOR - Build all final features
 # =============================================================================
 
-def build_final_features(spark, df_daily, df_buyer_monthly, run_date):
+def build_final_features(spark, df_daily, df_buyer_monthly, df_raw_monthly, run_date):
     """
     Orchestrate all feature groups and join into final output.
+
+    Args:
+        spark:           SparkSession
+        df_daily:        output of build_staging() — daily seller-level metrics
+        df_buyer_monthly: output of build_buyer_staging() — monthly buyer-seller pairs
+        df_raw_monthly:  output of features_from_raw() — monthly raw features (all months);
+                         pass in pre-built and cached so multi-date loops reuse it
+        run_date:        Python date; features are built for the month ending on
+                         f_last_day_of_previous_month(run_date)
 
     Returns: (df_ft, df_monthly)
         df_ft:      final feature DataFrame keyed by mst_seller + report_date
@@ -702,13 +931,26 @@ def build_final_features(spark, df_daily, df_buyer_monthly, run_date):
     # --- D) Top-N days ---
     df_ft_top_days = build_top_days(df_daily, df_seller_total)
 
+    # --- E) Raw monthly features (Step 3G) ---
+    # df_raw_monthly contains one row per (mst_seller, report_date=month_end) for
+    # every month in the raw data.  Filter to set_last_date (the target month_end
+    # for this run) so we join exactly one month's worth of raw-level features.
+    # report_date is dropped before the join because build_final_features adds its
+    # own report_date column after the join (see select below).
+    df_ft_raw_monthly = (
+        df_raw_monthly
+        .filter(F.col("report_date") == F.lit(str(set_last_date)).cast("date"))
+        .drop("report_date")
+    )
+
     # --- FINAL JOIN ---
     df_ft = (
         df_direct
-        .join(df_ft_monthly, on="mst_seller", how="left")
-        .join(df_ft_night_flag, on="mst_seller", how="left")
+        .join(df_ft_monthly,     on="mst_seller", how="left")
+        .join(df_ft_night_flag,  on="mst_seller", how="left")
         .join(df_ft_concentration, on="mst_seller", how="left")
-        .join(df_ft_top_days, on="mst_seller", how="left")
+        .join(df_ft_top_days,    on="mst_seller", how="left")
+        .join(df_ft_raw_monthly, on="mst_seller", how="left")
     )
 
     # Add report_date
@@ -732,7 +974,11 @@ if __name__ == "__main__":
     parser.add_argument("--stg-table", default=STG_TABLE, help="Staging output table")
     parser.add_argument("--monthly-table", default=MONTHLY_TABLE, help="Monthly intermediate table")
     parser.add_argument("--ft-table", default=FT_TABLE, help="Feature output table")
-    parser.add_argument("--run-date", default=None, help="Run date YYYY-MM-DD (default: today)")
+    parser.add_argument("--run-date",  default=None,
+                        help="Single run date YYYY-MM-DD (default: today)")
+    parser.add_argument("--run-dates", default=None,
+                        help="Comma-separated run dates YYYY-MM-DD,YYYY-MM-DD,... "
+                             "(overrides --run-date; used to backfill multiple months in one job)")
     parser.add_argument(
         "--mode", default="all",
         choices=["staging", "features", "all"],
@@ -740,12 +986,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.run_date:
-        run_date = datetime.datetime.strptime(args.run_date, "%Y-%m-%d").date()
+    # --run-dates takes priority; falls back to --run-date; defaults to today
+    if args.run_dates:
+        run_dates = [
+            datetime.datetime.strptime(d.strip(), "%Y-%m-%d").date()
+            for d in args.run_dates.split(",")
+        ]
+    elif args.run_date:
+        run_dates = [datetime.datetime.strptime(args.run_date, "%Y-%m-%d").date()]
     else:
-        run_date = datetime.date.today()
+        run_dates = [datetime.date.today()]
 
-    print("Run date: {}".format(run_date))
+    print("Run dates ({}): {}".format(len(run_dates), run_dates))
     print("Invoice table: {}".format(args.invoice_table))
 
     df_raw = spark.table(args.invoice_table)
@@ -757,19 +1009,35 @@ if __name__ == "__main__":
         print("Staging written to {}".format(args.stg_table))
 
     if args.mode in ("features", "all"):
-        print("Building features...")
         if args.mode == "features":
             df_stg = spark.table(args.stg_table)
         df_buyer = build_buyer_staging(df_raw)
 
-        df_ft, df_monthly = build_final_features(spark, df_stg, df_buyer, run_date)
+        # Build raw monthly features ONCE and cache — reused for every run_date
+        # in the loop below, avoiding redundant raw scans per iteration.
+        print("Building raw monthly features (Step 3G)...")
+        df_raw_monthly = features_from_raw(df_raw).cache()
 
-        # Save monthly intermediate
-        df_monthly.write.mode("overwrite").saveAsTable(args.monthly_table)
+        ft_parts      = []
+        monthly_parts = []
+        for run_date in run_dates:
+            print("  Computing features for run_date={}...".format(run_date))
+            df_ft, df_monthly = build_final_features(
+                spark, df_stg, df_buyer, df_raw_monthly, run_date
+            )
+            ft_parts.append(df_ft)
+            monthly_parts.append(df_monthly)
+
+        # Union all per-run_date results into single DataFrames before writing.
+        # For a single run_date the union is a no-op (returns the same DataFrame).
+        from functools import reduce
+        df_ft_all      = reduce(lambda a, b: a.union(b), ft_parts)
+        df_monthly_all = reduce(lambda a, b: a.union(b), monthly_parts)
+
+        df_monthly_all.write.mode("overwrite").saveAsTable(args.monthly_table)
         print("Monthly intermediate written to {}".format(args.monthly_table))
 
-        # Save final features
-        df_ft.write.mode("overwrite").saveAsTable(args.ft_table)
+        df_ft_all.write.mode("overwrite").saveAsTable(args.ft_table)
         print("Features written to {}".format(args.ft_table))
 
     print("Done.")
