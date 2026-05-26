@@ -118,11 +118,9 @@ CORE_END    = 4
 import datetime
 from functools import reduce
 from dateutil.relativedelta import relativedelta
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import IntegerType, DoubleType, StringType
-from pyspark.sql.column import Column, _to_java_column
 
 spark = SparkSession.builder.appName("viettel_ft_modified_optimized").getOrCreate()
 spark.version
@@ -1068,27 +1066,49 @@ def build_final_features(spark, df_daily, df_buyer_monthly, df_raw_monthly, run_
 
 def _write_partition(spark, df, table, partition_cols):
     """
-    Write df to a Hive table, overwriting only the partitions present in df.
+    2-step safe write for partitioned tables. No full-table overwrite.
 
-    - First call: creates the table with saveAsTable + partitionBy.
-    - Subsequent calls: uses insertInto with dynamic partition overwrite so
-      existing partitions for other months are not touched.
+    Step 1 — Drop existing partitions that match the values in df, using
+              ALTER TABLE DROP IF EXISTS PARTITION. Supported in both Hive
+              and Spark DataSource partitioned tables (Spark 2.4.4+).
+              Collects only the distinct partition key values from df (small),
+              not the full DataFrame.
+    Step 2 — Append df into the now-empty partition slots with write.mode("append").
+
+    First call (table does not exist): creates the table via saveAsTable+partitionBy,
+    then returns — no DROP needed.
+
+    Table existence is detected by attempting a limit(0) read, which works on
+    any catalog (Hive, DataSource, K8s warehouse) without relying on listTables
+    or SHOW TABLES.
+
+    Column order in df does not matter — partitionBy() identifies partition
+    columns by name, not position.
     """
-    spark.conf.set("hive.exec.dynamic.partition",      "true")
-    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
-
-    db  = table.split(".")[0] if "." in table else "default"
-    tbl = table.split(".")[-1]
-
+    # Table existence: read attempt works on any catalog.
     try:
-        table_exists = any(t.name == tbl for t in spark.catalog.listTables(db))
+        spark.table(table).limit(0).count()
+        table_exists = True
     except Exception:
         table_exists = False
 
     if not table_exists:
-        df.write.mode("overwrite").partitionBy(*partition_cols).saveAsTable(table)
-    else:
-        df.write.mode("overwrite").insertInto(table)
+        df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+        return
+
+    # Step 1: Drop the partitions that the new data will replace.
+    # Collect only distinct partition key combos (at most ~30 rows/month).
+    partition_values = df.select(*partition_cols).distinct().collect()
+    for row in partition_values:
+        part_spec = ", ".join(
+            "{}='{}'".format(col, row[col]) for col in partition_cols
+        )
+        spark.sql(
+            "ALTER TABLE {} DROP IF EXISTS PARTITION ({})".format(table, part_spec)
+        )
+
+    # Step 2: Append into the cleared partition slots.
+    df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
 
 
 def _data_month_str(run_date):
