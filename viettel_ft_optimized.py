@@ -93,33 +93,40 @@ FT_TABLE              = "your_schema.viettel_ft_seller"
 
 def _write_partition(spark, df, table, partition_cols):
     """
-    Write df to a Hive table, overwriting only the partitions present in df.
+    2-step safe write for partitioned tables. No full-table overwrite.
 
-    - First call: creates the table with saveAsTable + partitionBy.
-    - Subsequent calls: uses insertInto with dynamic partition overwrite,
-      so existing partitions for other months are not touched.
+    Step 1 — Drop existing partitions matching the values in df via
+              ALTER TABLE DROP IF EXISTS PARTITION (Spark 2.4.4+, Hive + DataSource).
+    Step 2 — Append df into the cleared slots with write.mode("append").
 
-    Hive dynamic partition settings are applied before each write.
+    First call (table does not exist): creates the table via saveAsTable+partitionBy.
+    Table existence is detected by a limit(0) read — works on any catalog.
+    Column order in df does not matter — partitionBy() identifies partition
+    columns by name, not position.
     """
-    spark.conf.set("hive.exec.dynamic.partition",      "true")
-    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
-
-    db  = table.split(".")[0] if "." in table else "default"
-    tbl = table.split(".")[-1]
-
+    # Table existence: read attempt works on any catalog.
     try:
-        table_exists = any(
-            t.name == tbl for t in spark.catalog.listTables(db)
-        )
+        spark.table(table).limit(0).count()
+        table_exists = True
     except Exception:
         table_exists = False
 
     if not table_exists:
-        df.write.mode("overwrite").partitionBy(*partition_cols).saveAsTable(table)
-    else:
-        # insertInto respects hive dynamic partition overwrite:
-        # only the partitions present in df are replaced.
-        df.write.mode("overwrite").insertInto(table)
+        df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+        return
+
+    # Step 1: Drop the partitions that the new data will replace.
+    partition_values = df.select(*partition_cols).distinct().collect()
+    for row in partition_values:
+        part_spec = ", ".join(
+            "{}='{}'".format(col, row[col]) for col in partition_cols
+        )
+        spark.sql(
+            "ALTER TABLE {} DROP IF EXISTS PARTITION ({})".format(table, part_spec)
+        )
+
+    # Step 2: Append into the cleared partition slots.
+    df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
 
 
 # =============================================================================

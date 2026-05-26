@@ -118,11 +118,9 @@ CORE_END    = 4
 import datetime
 from functools import reduce
 from dateutil.relativedelta import relativedelta
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import IntegerType, DoubleType, StringType
-from pyspark.sql.column import Column, _to_java_column
 
 spark = SparkSession.builder.appName("viettel_ft_modified_optimized").getOrCreate()
 spark.version
@@ -1068,27 +1066,49 @@ def build_final_features(spark, df_daily, df_buyer_monthly, df_raw_monthly, run_
 
 def _write_partition(spark, df, table, partition_cols):
     """
-    Write df to a Hive table, overwriting only the partitions present in df.
+    2-step safe write for partitioned tables. No full-table overwrite.
 
-    - First call: creates the table with saveAsTable + partitionBy.
-    - Subsequent calls: uses insertInto with dynamic partition overwrite so
-      existing partitions for other months are not touched.
+    Step 1 — Drop existing partitions that match the values in df, using
+              ALTER TABLE DROP IF EXISTS PARTITION. Supported in both Hive
+              and Spark DataSource partitioned tables (Spark 2.4.4+).
+              Collects only the distinct partition key values from df (small),
+              not the full DataFrame.
+    Step 2 — Append df into the now-empty partition slots with write.mode("append").
+
+    First call (table does not exist): creates the table via saveAsTable+partitionBy,
+    then returns — no DROP needed.
+
+    Table existence is detected by attempting a limit(0) read, which works on
+    any catalog (Hive, DataSource, K8s warehouse) without relying on listTables
+    or SHOW TABLES.
+
+    Column order in df does not matter — partitionBy() identifies partition
+    columns by name, not position.
     """
-    spark.conf.set("hive.exec.dynamic.partition",      "true")
-    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
-
-    db  = table.split(".")[0] if "." in table else "default"
-    tbl = table.split(".")[-1]
-
+    # Table existence: read attempt works on any catalog.
     try:
-        table_exists = any(t.name == tbl for t in spark.catalog.listTables(db))
+        spark.table(table).limit(0).count()
+        table_exists = True
     except Exception:
         table_exists = False
 
     if not table_exists:
-        df.write.mode("overwrite").partitionBy(*partition_cols).saveAsTable(table)
-    else:
-        df.write.mode("overwrite").insertInto(table)
+        df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+        return
+
+    # Step 1: Drop the partitions that the new data will replace.
+    # Collect only distinct partition key combos (at most ~30 rows/month).
+    partition_values = df.select(*partition_cols).distinct().collect()
+    for row in partition_values:
+        part_spec = ", ".join(
+            "{}='{}'".format(col, row[col]) for col in partition_cols
+        )
+        spark.sql(
+            "ALTER TABLE {} DROP IF EXISTS PARTITION ({})".format(table, part_spec)
+        )
+
+    # Step 2: Append into the cleared partition slots.
+    df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
 
 
 def _data_month_str(run_date):
@@ -1286,7 +1306,158 @@ def run_pipeline(spark, run_dates,
 
 
 # =============================================================================
-# %% [Cell 21 — Notebook execution]
+# %% [Cell 21 — Unit test: _write_partition]
+# %pyspark
+# Run this cell BEFORE Cell 22 to verify the write function is working
+# correctly on this platform before touching any real staging tables.
+# All tests use a disposable test table that is dropped at the end.
+# =============================================================================
+
+_TEST_TABLE = "kpidh_db.thannq6_test_write_partition"
+spark.sql("DROP TABLE IF EXISTS {}".format(_TEST_TABLE))
+
+def _make_df(rows):
+    """Helper: build a small test DataFrame with (mst_seller, sales, report_date)."""
+    return spark.createDataFrame(
+        [(s, amt, datetime.date(y, m, d)) for s, amt, y, m, d in rows],
+        ["mst_seller", "daily_total_sales", "report_date"],
+    )
+
+# Reusable data for 3 months, 2 rows per month (simulates 2 active days per month)
+M1 = [("A", 100.0, 2024, 12, 30), ("B", 200.0, 2024, 12, 31)]   # Dec 2024
+M2 = [("A", 300.0, 2025,  1, 30), ("C", 400.0, 2025,  1, 31)]   # Jan 2025
+M3 = [("B", 500.0, 2025,  2, 27), ("C", 600.0, 2025,  2, 28)]   # Feb 2025
+
+def _check(label, df, expected_dates, expected_rows):
+    """Assert exact partition dates and total row count. Print PASS or raise."""
+    actual_dates = sorted(
+        str(r.report_date)
+        for r in df.select("report_date").distinct().collect()
+    )
+    actual_rows = df.count()
+    assert actual_dates == sorted(expected_dates), \
+        "{} — dates mismatch.\n  expected: {}\n  got:      {}".format(
+            label, sorted(expected_dates), actual_dates)
+    assert actual_rows == expected_rows, \
+        "{} — row count mismatch. expected={}, got={}".format(
+            label, expected_rows, actual_rows)
+    print("  PASS  {}  |  dates={}  rows={}".format(label, actual_dates, actual_rows))
+
+print("=" * 60)
+print("_write_partition unit tests")
+print("=" * 60)
+
+# ------------------------------------------------------------------
+# TEST 1: First write creates the table correctly
+# ------------------------------------------------------------------
+print("\n[Test 1] First write — table creation")
+_write_partition(spark, _make_df(M1), _TEST_TABLE, ["report_date"])
+_check("T1", spark.table(_TEST_TABLE),
+       expected_dates=["2024-12-30", "2024-12-31"],
+       expected_rows=2)
+
+# ------------------------------------------------------------------
+# TEST 2: Append a NEW month — existing month must not be touched
+# ------------------------------------------------------------------
+print("\n[Test 2] Append new month (M2) — M1 must survive")
+_write_partition(spark, _make_df(M2), _TEST_TABLE, ["report_date"])
+_check("T2", spark.table(_TEST_TABLE),
+       expected_dates=["2024-12-30", "2024-12-31", "2025-01-30", "2025-01-31"],
+       expected_rows=4)
+
+# ------------------------------------------------------------------
+# TEST 3: Append a third month — M1 and M2 must not be touched
+# ------------------------------------------------------------------
+print("\n[Test 3] Append third month (M3) — M1 and M2 must survive")
+_write_partition(spark, _make_df(M3), _TEST_TABLE, ["report_date"])
+_check("T3", spark.table(_TEST_TABLE),
+       expected_dates=["2024-12-30", "2024-12-31",
+                       "2025-01-30", "2025-01-31",
+                       "2025-02-27", "2025-02-28"],
+       expected_rows=6)
+
+# ------------------------------------------------------------------
+# TEST 4: Re-run M1 (2nd run, same month) — must REPLACE M1, not duplicate.
+#         M2 and M3 must not be touched.
+# ------------------------------------------------------------------
+print("\n[Test 4] 2nd run M1 — M1 replaced (no duplicates), M2+M3 untouched")
+M1_v2 = [("X", 999.0, 2024, 12, 30), ("Y", 888.0, 2024, 12, 31)]  # different sellers
+_write_partition(spark, _make_df(M1_v2), _TEST_TABLE, ["report_date"])
+result = spark.table(_TEST_TABLE)
+_check("T4 total", result,
+       expected_dates=["2024-12-30", "2024-12-31",
+                       "2025-01-30", "2025-01-31",
+                       "2025-02-27", "2025-02-28"],
+       expected_rows=6)
+# M1 sellers must be X,Y now (not A,B from the first write)
+m1_sellers = sorted(
+    r.mst_seller
+    for r in result.filter(result.report_date == datetime.date(2024, 12, 31)).collect()
+)
+assert m1_sellers == ["Y"], \
+    "T4 — M1 seller mismatch, expected ['Y'], got {}".format(m1_sellers)
+print("  PASS  T4 seller check — M1 correctly replaced with new data")
+
+# ------------------------------------------------------------------
+# TEST 5: Re-run M2 and M3 together in one call (multi-partition single write)
+#         Both must be replaced, M1 must not be touched.
+# ------------------------------------------------------------------
+print("\n[Test 5] 2nd run M2+M3 in ONE call — both replaced, M1 untouched")
+M2M3_v2 = [
+    ("P", 11.0, 2025, 1, 30), ("Q", 22.0, 2025, 1, 31),   # new M2
+    ("R", 33.0, 2025, 2, 27), ("S", 44.0, 2025, 2, 28),   # new M3
+]
+_write_partition(spark, _make_df(M2M3_v2), _TEST_TABLE, ["report_date"])
+result = spark.table(_TEST_TABLE)
+_check("T5 total", result,
+       expected_dates=["2024-12-30", "2024-12-31",
+                       "2025-01-30", "2025-01-31",
+                       "2025-02-27", "2025-02-28"],
+       expected_rows=6)
+m2_sellers = sorted(
+    r.mst_seller
+    for r in result.filter(result.report_date == datetime.date(2025, 1, 31)).collect()
+)
+assert m2_sellers == ["Q"], \
+    "T5 — M2 seller mismatch, expected ['Q'], got {}".format(m2_sellers)
+m1_sellers_after = sorted(
+    r.mst_seller
+    for r in result.filter(result.report_date == datetime.date(2024, 12, 31)).collect()
+)
+assert m1_sellers_after == ["Y"], \
+    "T5 — M1 was overwritten! expected ['Y'], got {}".format(m1_sellers_after)
+print("  PASS  T5 seller checks — M2+M3 replaced, M1 preserved")
+
+# ------------------------------------------------------------------
+# TEST 6: No stray report_date values — exact set, nothing extra
+# ------------------------------------------------------------------
+print("\n[Test 6] No stray report_date values in table")
+all_dates = sorted(
+    str(r.report_date)
+    for r in spark.table(_TEST_TABLE).select("report_date").distinct().collect()
+)
+expected_final = sorted([
+    "2024-12-30", "2024-12-31",
+    "2025-01-30", "2025-01-31",
+    "2025-02-27", "2025-02-28",
+])
+assert all_dates == expected_final, \
+    "T6 — stray dates found!\n  expected: {}\n  got:      {}".format(
+        expected_final, all_dates)
+print("  PASS  T6 — exact dates: {}".format(all_dates))
+
+# ------------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------------
+spark.sql("DROP TABLE IF EXISTS {}".format(_TEST_TABLE))
+print("\n" + "=" * 60)
+print("ALL TESTS PASSED — _write_partition is safe to use.")
+print("Test table dropped. Proceed to Cell 22 (Notebook execution) to run the pipeline.")
+print("=" * 60)
+
+
+# =============================================================================
+# %% [Cell 22 — Notebook execution]
 # %pyspark
 # =============================================================================
 
