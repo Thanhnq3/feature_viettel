@@ -113,6 +113,8 @@ def _write_partition(spark, df, table, partition_cols):
 
     if not table_exists:
         df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+        # Refresh so the next spark.table() in the same session sees the new table.
+        spark.catalog.refreshTable(table)
         return
 
     # Step 1: Drop the partitions that the new data will replace.
@@ -127,6 +129,10 @@ def _write_partition(spark, df, table, partition_cols):
 
     # Step 2: Append into the cleared partition slots.
     df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+    # Refresh after each write so subsequent spark.table() calls see the latest data
+    # instead of a stale cached plan. Without this, Spark 2.4's SessionCatalog can
+    # serve an invalidated entry that causes "Table or view not found" on the next read.
+    spark.catalog.refreshTable(table)
 
 
 # =============================================================================
