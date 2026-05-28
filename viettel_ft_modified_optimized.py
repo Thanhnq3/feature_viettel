@@ -1094,6 +1094,8 @@ def _write_partition(spark, df, table, partition_cols):
 
     if not table_exists:
         df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+        # Refresh so the next spark.table() in the same session sees the new table.
+        spark.catalog.refreshTable(table)
         return
 
     # Step 1: Drop the partitions that the new data will replace.
@@ -1109,6 +1111,10 @@ def _write_partition(spark, df, table, partition_cols):
 
     # Step 2: Append into the cleared partition slots.
     df.write.mode("append").partitionBy(*partition_cols).saveAsTable(table)
+    # Refresh after each write so subsequent spark.table() calls see the latest data
+    # instead of a stale cached plan. Without this, Spark 2.4's SessionCatalog can
+    # serve an invalidated entry that causes "Table or view not found" on the next read.
+    spark.catalog.refreshTable(table)
 
 
 def _data_month_str(run_date):
@@ -1452,12 +1458,107 @@ print("  PASS  T6 — exact dates: {}".format(all_dates))
 spark.sql("DROP TABLE IF EXISTS {}".format(_TEST_TABLE))
 print("\n" + "=" * 60)
 print("ALL TESTS PASSED — _write_partition is safe to use.")
-print("Test table dropped. Proceed to Cell 22 (Notebook execution) to run the pipeline.")
+print("Test table dropped. Proceed to Cell 23 (Notebook execution) to run the pipeline.")
 print("=" * 60)
 
 
 # =============================================================================
-# %% [Cell 22 — Notebook execution]
+# %% [Cell 22 — Semantic checks: raw table partition alignment]
+# %pyspark
+#
+# PURPOSE: Diagnose whether the raw table's partition_month column aligns with
+# the actual invoice signed dates (signed_date_proc). Run this cell ONCE before
+# the first real pipeline run and read the output carefully.
+#
+# These checks do NOT assert pass/fail — they print diagnostic information that
+# you must interpret to decide if the pipeline filter logic needs adjustment.
+# =============================================================================
+
+print("=" * 60)
+print("SEMANTIC CHECKS — raw table partition alignment")
+print("Run once, read results before proceeding to Cell 23.")
+print("=" * 60)
+
+# ------------------------------------------------------------------
+# CHECK 1: Is partition_month a physical Hive/Spark partition, or just a data column?
+#
+# EXPECTED (good): The output of DESCRIBE FORMATTED should contain a section
+#   "# Partition Information" listing partition_month as a partition key.
+#   This means Spark will physically skip non-matching partition directories
+#   when you filter on partition_month — the pipeline's core performance assumption.
+#
+# BAD OUTCOME: partition_month does NOT appear under "# Partition Information".
+#   It is just a regular data column. Every filter on it causes a full table scan.
+#   In this case, the pipeline still produces correct results but loses its main
+#   performance benefit (no partition pruning). Consider repartitioning the raw
+#   table or switching to a different partition column.
+# ------------------------------------------------------------------
+print("\n[Check 1] Physical partition structure of raw table")
+print("  Look for '# Partition Information' in the output below.")
+print("  partition_month should appear there for pruning to work.\n")
+spark.sql("DESCRIBE FORMATTED {}".format(INVOICE_TABLE)).show(60, truncate=False)
+
+# ------------------------------------------------------------------
+# CHECK 2: Within partition_month = target_month, what is the actual
+#          date range of signed_date_proc (the invoice signed timestamp)?
+#
+# Set _CHECK_MONTH to the partition_month value you intend to process
+# (e.g. "202412" when run_date = "2025-01-01").
+#
+# EXPECTED (good): min and max signed_date_proc both fall within December 2024.
+#   This means partition_month represents the invoice's own month, so filtering
+#   by partition_month gives you exactly one month of invoices. The staging
+#   report_date will correctly be limited to that month.
+#
+# BAD OUTCOME: min/max signed_date_proc spans far beyond December 2024
+#   (e.g. 2023-01 to 2025-12). This means partition_month is a batch/ingestion
+#   date — the partition holds invoices loaded at that time, not invoices dated
+#   in that month. A single partition can contain invoices from many periods.
+#   In this case an extra filter on signed_date_proc is needed inside
+#   run_staging_phase to restrict to the target month's invoice dates.
+# ------------------------------------------------------------------
+_CHECK_MONTH = "202412"   # <-- change to the month you are testing
+
+print("\n[Check 2] Date range of '{}' in column {}".format(_CHECK_MONTH, COL_PARTITION_TIMESTAMP))
+print("  Expected (partition = invoice month): min and max both within {}\n".format(_CHECK_MONTH))
+spark.table(INVOICE_TABLE)\
+    .filter(F.col(COL_PARTITION) == _CHECK_MONTH)\
+    .select(
+        F.min(COL_PARTITION_TIMESTAMP).alias("min_signed_date"),
+        F.max(COL_PARTITION_TIMESTAMP).alias("max_signed_date"),
+        F.count(F.lit(1)).alias("row_count"),
+    ).show(truncate=False)
+
+# ------------------------------------------------------------------
+# CHECK 3: Distinct partition_month values in the raw table.
+#
+# EXPECTED (good): Values like "202401", "202402", ..., "202412" — one entry
+#   per calendar month, format matches "YYYYMM". The pipeline filter
+#   F.col(COL_PARTITION) == "202412" will correctly match rows.
+#
+# BAD OUTCOME A: Format does not match "YYYYMM" (e.g. "2024-12", "12/2024").
+#   The filter will match zero rows. Staging tables will be written empty.
+#   Fix: update _data_month_str() to produce the matching format.
+#
+# BAD OUTCOME B: Very few distinct values (e.g. only "202412" for the whole
+#   table). All historical data was bulk-loaded into one partition. Partition
+#   pruning is meaningless and the staging table will contain all history.
+#   Fix: an extra filter on signed_date_proc is required.
+# ------------------------------------------------------------------
+print("\n[Check 3] Distinct '{}' values in raw table".format(COL_PARTITION))
+print("  Expected: one entry per month, format 'YYYYMM' (e.g. 202401, 202412)\n")
+spark.table(INVOICE_TABLE)\
+    .select(COL_PARTITION)\
+    .distinct()\
+    .orderBy(COL_PARTITION)\
+    .show(50, truncate=False)
+
+print("\nSemantic checks complete. Interpret results above before running Cell 23.")
+
+
+# =============================================================================
+# %% [Cell 23 — Notebook execution]
+# %pyspark
 # %pyspark
 # =============================================================================
 
